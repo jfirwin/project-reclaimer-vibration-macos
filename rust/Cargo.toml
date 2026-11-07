@@ -1,0 +1,13 @@
+[package]
+name = "reclaimer-rumble"
+version = "0.1.0"
+edition = "2021"
+description = "macOS controller rumble driver and fallback for Project Reclaimer"
+
+[lib]
+name = "reclaimer_rumble"
+path = "src/lib.rs"
+
+[[bin]]
+name = "test-rumble"
+path = "src/bin/test_rumble.rs"
