@@ -5,20 +5,41 @@
 #import <IOKit/hid/IOHIDManager.h>
 #import <objc/runtime.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 static IOHIDDeviceRef g_8bitdo_device = NULL;
 static pthread_mutex_t g_device_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint8_t g_left_motor = 0;
-static uint8_t g_right_motor = 0;
 
-static void send_8bitdo_rumble(uint8_t left, uint8_t right) {
+// Non-blocking coalescing state for low-latency Bluetooth rumble
+static atomic_uchar g_target_left = 0;
+static atomic_uchar g_target_right = 0;
+static uint8_t g_last_sent_left = 0xFF;
+static uint8_t g_last_sent_right = 0xFF;
+static atomic_bool g_dispatch_pending = false;
+static dispatch_queue_t g_rumble_queue = NULL;
+
+static void flush_rumble_to_device(void) {
+    uint8_t left = atomic_load_explicit(&g_target_left, memory_order_relaxed);
+    uint8_t right = atomic_load_explicit(&g_target_right, memory_order_relaxed);
+
     pthread_mutex_lock(&g_device_lock);
     IOHIDDeviceRef dev = g_8bitdo_device;
-    if (dev) {
+    if (dev && (left != g_last_sent_left || right != g_last_sent_right)) {
         uint8_t pkt[5] = { 0x05, left, right, 0x00, 0x00 };
         IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, 0x05, pkt, sizeof(pkt));
+        g_last_sent_left = left;
+        g_last_sent_right = right;
     }
     pthread_mutex_unlock(&g_device_lock);
+}
+
+static inline void schedule_rumble_update(void) {
+    if (!atomic_exchange_explicit(&g_dispatch_pending, true, memory_order_acq_rel)) {
+        dispatch_async(g_rumble_queue, ^{
+            atomic_store_explicit(&g_dispatch_pending, false, memory_order_release);
+            flush_rumble_to_device();
+        });
+    }
 }
 
 // HID device matching callbacks for 8BitDo (VID 0x2DC8)
@@ -28,6 +49,8 @@ static void device_matched(void *context, IOReturn result, void *sender, IOHIDDe
         CFRelease(g_8bitdo_device);
     }
     g_8bitdo_device = (IOHIDDeviceRef)CFRetain(device);
+    g_last_sent_left = 0xFF;
+    g_last_sent_right = 0xFF;
     NSLog(@"[rumble_bridge] 8BitDo controller discovered & retained: %p", g_8bitdo_device);
     pthread_mutex_unlock(&g_device_lock);
 }
@@ -43,6 +66,8 @@ static void device_removed(void *context, IOReturn result, void *sender, IOHIDDe
 }
 
 static void init_hid_manager(void) {
+    g_rumble_queue = dispatch_queue_create("dev.projectreclaimer.8bitdo_rumble", DISPATCH_QUEUE_SERIAL);
+
     IOHIDManagerRef mgr = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
     int vid = 0x2DC8;
     CFNumberRef vidNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &vid);
@@ -66,6 +91,8 @@ static void init_hid_manager(void) {
             CFSetGetValues(set, (const void**)devs);
             pthread_mutex_lock(&g_device_lock);
             g_8bitdo_device = (IOHIDDeviceRef)CFRetain(devs[0]);
+            g_last_sent_left = 0xFF;
+            g_last_sent_right = 0xFF;
             NSLog(@"[rumble_bridge] 8BitDo controller matched on startup: %p", g_8bitdo_device);
             pthread_mutex_unlock(&g_device_lock);
         }
@@ -93,11 +120,11 @@ static void init_hid_manager(void) {
 - (BOOL)stopAtTime:(NSTimeInterval)time error:(NSError **)error {
     if (error) *error = nil;
     if ([self.locality isEqualToString:GCHapticsLocalityLeftHandle]) {
-        g_left_motor = 0;
+        atomic_store_explicit(&g_target_left, 0, memory_order_relaxed);
     } else {
-        g_right_motor = 0;
+        atomic_store_explicit(&g_target_right, 0, memory_order_relaxed);
     }
-    send_8bitdo_rumble(g_left_motor, g_right_motor);
+    schedule_rumble_update();
     return YES;
 }
 
@@ -110,16 +137,11 @@ static void init_hid_manager(void) {
             if (val > 1.0f) val = 1.0f;
             uint8_t byteVal = (uint8_t)(val * 255.0f);
             if ([self.locality isEqualToString:GCHapticsLocalityLeftHandle]) {
-                if (g_left_motor != byteVal) {
-                    g_left_motor = byteVal;
-                    send_8bitdo_rumble(g_left_motor, g_right_motor);
-                }
+                atomic_store_explicit(&g_target_left, byteVal, memory_order_relaxed);
             } else {
-                if (g_right_motor != byteVal) {
-                    g_right_motor = byteVal;
-                    send_8bitdo_rumble(g_left_motor, g_right_motor);
-                }
+                atomic_store_explicit(&g_target_right, byteVal, memory_order_relaxed);
             }
+            schedule_rumble_update();
         }
     }
     return YES;
@@ -218,7 +240,7 @@ static GCDeviceHaptics *swizzled_haptics(GCController *self, SEL _cmd) {
 }
 
 __attribute__((constructor)) static void setup_rumble_bridge(void) {
-    NSLog(@"[rumble_bridge] Initializing 8BitDo Native Rumble Bridge...");
+    NSLog(@"[rumble_bridge] Initializing 8BitDo Native Rumble Bridge (low-latency coalesced)...");
     init_hid_manager();
 
     Class gcClass = objc_getClass("GCController");
