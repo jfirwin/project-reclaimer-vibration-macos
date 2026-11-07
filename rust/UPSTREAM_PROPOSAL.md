@@ -88,7 +88,14 @@ impl EightBitDoRumble {
 }
 ```
 
-### Suggested Integration in Engine Gamepad Loop
+### Performance Note: Bluetooth Bandwidth & Coalescing
+
+`IOHIDDeviceSetReport` is a synchronous, blocking HID transaction over USB and Bluetooth. Over Bluetooth ACL/L2CAP, sending separate reports for left and right motors on every 60 Hz frame creates 120 packets/sec, which exceeds Bluetooth throughput and causes queue backlog (perceived as delayed, "sluggish" vibration).
+
+**Best Practice:**
+1. Update target motor intensities (`left` and `right`) in memory.
+2. Coalesce both motors into a single 5-byte report (`0x05`).
+3. Dispatch reports asynchronously off the main engine loop (or only when values actually change), dropping intermediate decay steps if the Bluetooth stack is busy transmitting the previous packet.
 
 In the controller initialization routine (where `controller.haptics()` is queried):
 
